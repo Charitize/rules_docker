@@ -45,18 +45,17 @@ def _impl(ctx):
     # Parse and get destination registry to be pushed to
     registry = ctx.expand_make_variables("registry", ctx.attr.registry, {})
     repository = ctx.expand_make_variables("repository", ctx.attr.repository, {})
-    tag = ctx.expand_make_variables("tag", ctx.attr.tag, {})
-
-    # If a tag file is provided, override <tag> with tag value
-    if ctx.file.tag_file:
-        tag = "$(cat {})".format(_get_runfile_path(ctx, ctx.file.tag_file))
-        pusher_input.append(ctx.file.tag_file)
+    # No set support in Starlark, so we are using dictionary comprehension and
+    # keys access to dedupe tags.
+    tags = {ctx.expand_make_variables("tag", tag, {}): None for tag in ctx.attr.img_tags}.keys()
 
     # If any stampable attr contains python format syntax (which is how users
     # configure stamping), we enable stamping.
     if ctx.attr.stamp:
         print("Attr 'stamp' is deprecated; it is now automatically inferred. Please remove it from %s" % ctx.label)
-    stamp = "{" in tag or "{" in registry or "{" in repository
+    stamp = "{" in registry or "{" in repository
+    for tag in tags:
+        stamp = stamp or "{" in tag
     stamp_inputs = [ctx.info_file, ctx.version_file] if stamp else []
     for f in stamp_inputs:
         pusher_args += ["-stamp-info-file", "%s" % _get_runfile_path(ctx, f)]
@@ -64,29 +63,9 @@ def _impl(ctx):
 
     # Construct container_parts for input to pusher.
     image = _get_layers(ctx, ctx.label.name, ctx.attr.image)
-    pusher_img_args, pusher_img_inputs = _gen_img_args(ctx, image, _get_runfile_path)
-    pusher_args += pusher_img_args
-    pusher_input += pusher_img_inputs
     digester_img_args, digester_img_inputs = _gen_img_args(ctx, image)
     digester_input += digester_img_inputs
     digester_args += digester_img_args
-    tarball = image.get("legacy")
-    if tarball:
-        print("Pushing an image based on a tarball can be very " +
-              "expensive.  If the image is the output of a " +
-              "container_build, consider dropping the '.tar' extension. " +
-              "If the image is checked in, consider using " +
-              "container_import instead.")
-
-    pusher_args.append("--format={}".format(ctx.attr.format))
-    pusher_args.append("--dst={registry}/{repository}:{tag}".format(
-        registry = registry,
-        repository = repository,
-        tag = tag,
-    ))
-
-    if ctx.attr.skip_unchanged_digest:
-        pusher_args += ["-skip-unchanged-digest"]
     digester_args += ["--dst", str(ctx.outputs.digest.path), "--format", str(ctx.attr.format)]
     ctx.actions.run(
         inputs = digester_input,
@@ -97,21 +76,58 @@ def _impl(ctx):
         mnemonic = "ContainerPushDigest",
     )
 
-    # If the docker toolchain is configured to use a custom client config
-    # directory, use that instead
-    toolchain_info = ctx.toolchains["@io_bazel_rules_docker//toolchains/docker:toolchain_type"].info
-    if toolchain_info.client_config != "":
-        pusher_args += ["-client-config-dir", str(toolchain_info.client_config)]
+    tarball = image.get("legacy")
+    if tarball:
+        print("Pushing an image based on a tarball can be very " +
+              "expensive.  If the image is the output of a " +
+              "container_build, consider dropping the '.tar' extension. " +
+              "If the image is checked in, consider using " +
+              "container_import instead.")
 
-    pusher_runfiles = [ctx.executable._pusher] + pusher_input
-    runfiles = ctx.runfiles(files = pusher_runfiles)
-    runfiles = runfiles.merge(ctx.attr._pusher[DefaultInfo].default_runfiles)
+    scripts = []
+    runfiles = []
+    for index, tag in enumerate(tags):
+        pusher_img_args, pusher_img_inputs = _gen_img_args(ctx, image, _get_runfile_path)
+        pusher_args += pusher_img_args
+        pusher_input += pusher_img_inputs
+        pusher_args.append("--format={}".format(ctx.attr.format))
+        pusher_args.append("--dst={registry}/{repository}:{tag}".format(
+            registry = registry,
+            repository = repository,
+            tag = tag,
+        ))
+
+        if ctx.attr.skip_unchanged_digest:
+            pusher_args += ["-skip-unchanged-digest"]
+
+        # If the docker toolchain is configured to use a custom client config
+        # directory, use that instead
+        toolchain_info = ctx.toolchains["@io_bazel_rules_docker//toolchains/docker:toolchain_type"].info
+        if toolchain_info.client_config != "":
+            pusher_args += ["-client-config-dir", str(toolchain_info.client_config)]
+
+        out = ctx.actions.declare_file("%s.%d.push" % (ctx.label.name, index))
+        ctx.actions.expand_template(
+            template = ctx.file._tag_tpl,
+            substitutions = {
+                "%{args}": " ".join(pusher_args),
+                "%{container_pusher}": _get_runfile_path(ctx, ctx.executable._pusher),
+            },
+            output = out,
+            is_executable = True,
+        )
+
+        scripts += [out]
+        runfiles += [out]
+        runfiles += pusher_img_inputs
 
     ctx.actions.expand_template(
-        template = ctx.file._tag_tpl,
+        template = ctx.file._all_tpl,
         substitutions = {
-            "%{args}": " ".join(pusher_args),
-            "%{container_pusher}": _get_runfile_path(ctx, ctx.executable._pusher),
+            "%{push_statements}": "\n".join([
+                "async \"%s\"" % _get_runfile_path(ctx, command)
+                for command in scripts
+            ]),
         },
         output = ctx.outputs.executable,
         is_executable = True,
@@ -119,19 +135,12 @@ def _impl(ctx):
 
     return [
         DefaultInfo(
-            executable = ctx.outputs.executable,
-            runfiles = runfiles,
-        ),
-        PushInfo(
-            registry = registry,
-            repository = repository,
-            tag = tag,
-            stamp = stamp,
-            stamp_inputs = stamp_inputs,
-            digest = ctx.outputs.digest,
+            runfiles = ctx.runfiles(
+                files = [ctx.executable._pusher] + stamp_inputs + runfiles,
+                transitive_files = ctx.attr._pusher[DefaultInfo].default_runfiles.files,
+            ),
         ),
     ]
-
 # Pushes a container image to a registry.
 container_push = rule(
     attrs = dicts.add({
@@ -164,13 +173,9 @@ container_push = rule(
             default = False,
             mandatory = False,
         ),
-        "tag": attr.string(
-            default = "latest",
-            doc = "(optional) The tag of the image, default to 'latest'.",
-        ),
-        "tag_file": attr.label(
-            allow_single_file = True,
-            doc = "(optional) The label of the file with tag value. Overrides 'tag'.",
+        "img_tags": attr.string_list(
+            default = ["latest"],
+            doc = "(optional) The tag of the image, default to ['latest'].",
         ),
         "_digester": attr.label(
             default = "//container/go/cmd/digester",
@@ -182,6 +187,10 @@ container_push = rule(
             cfg = "host",
             executable = True,
             allow_files = True,
+        ),
+        "_all_tpl": attr.label(
+            default = Label("//contrib:push-all.sh.tpl"),
+            allow_single_file = True,
         ),
         "_tag_tpl": attr.label(
             default = Label("//container:push-tag.sh.tpl"),
